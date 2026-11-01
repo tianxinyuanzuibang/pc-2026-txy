@@ -74,10 +74,10 @@ async fn main() {
         fixture.token.take(),
     )
     .unwrap();
-    assert!(matches!(
-        api.server_info().await.unwrap(),
-        DiscoveryDocument::Server(_)
-    ));
+    let DiscoveryDocument::Server(server) = api.server_info().await.unwrap() else {
+        panic!("expected PowerContext discovery");
+    };
+    let server_id = server.server_id;
     if args
         .get(2)
         .is_some_and(|argument| argument == "discovery-only")
@@ -86,6 +86,9 @@ async fn main() {
         return;
     }
     api.live().await.unwrap();
+    let identity = api.connection_identity().await.unwrap();
+    assert_eq!(identity.server_id, server_id);
+    assert_eq!(identity.principal.is_some(), has_token);
     api.readiness().await.unwrap();
     if has_token {
         api.principal().await.unwrap();
@@ -137,16 +140,37 @@ async fn main() {
     assert_eq!(exact.text, text);
     // Exercise the same native context owner used by product IPC, not only bare HTTP adapters.
     let temporary = tempfile::tempdir().unwrap();
-    let manager = ConnectionManager::with_compatibility(
-        ProfileRepository::open(
-            temporary.path().join("profiles.json"),
-            std::sync::Arc::new(NativeVault),
+    let repository = ProfileRepository::open(
+        temporary.path().join("profiles.json"),
+        std::sync::Arc::new(NativeVault),
+    )
+    .unwrap();
+    let product = args.get(2).is_some_and(|argument| argument == "product");
+    let manager = if product {
+        ConnectionManager::new(repository)
+    } else {
+        ConnectionManager::with_compatibility(
+            repository,
+            vec![fixture.compatibility_profile.clone()],
         )
-        .unwrap(),
-        vec![fixture.compatibility_profile.clone()],
-    );
+    };
     let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
-    let compatibility = &fixture.compatibility_profile.id;
+    let compatibility = if product {
+        manager
+            .state()
+            .unwrap()
+            .compatibility_profiles
+            .into_iter()
+            .find(|profile| {
+                profile.server_commit == fixture.compatibility_profile.server_commit
+                    && profile.contract_sha256 == fixture.compatibility_profile.contract_sha256
+                    && profile.artifact_sha256 == fixture.compatibility_profile.artifact_sha256
+            })
+            .expect("independently qualified product record for the actual wheel")
+            .id
+    } else {
+        fixture.compatibility_profile.id.clone()
+    };
     let credential = raw["token"]
         .as_str()
         .map(|value| serde_json::json!({"secret":value,"storage":"session_only"}));
@@ -158,13 +182,19 @@ async fn main() {
     assert!(manager.state().unwrap().active.is_none());
     let checked = manager.check(&profile, false).await.unwrap();
     assert!(checked.active.is_none());
+    assert!(checked.reports.iter().all(|report| report.readiness.value.is_none() && report.readiness_checked_at.is_none()));
     assert!(
         checked
             .reports
             .iter()
             .any(|report| report.connection_id == profile)
     );
-    let generation = manager.check(&profile, true).await.unwrap().generation;
+    let state = manager.check(&profile, true).await.unwrap();
+    let generation = state.generation;
+    let revision = state.active.as_ref().unwrap().report.revision;
+    let probed = manager.probe_readiness(&profile, revision).await.unwrap();
+    assert_eq!(probed.generation, generation);
+    assert!(probed.reports[0].readiness_checked_at.is_some());
     let generation = manager
         .select_scope(generation, &fixture.scope_id)
         .await
@@ -175,6 +205,10 @@ async fn main() {
     let expected = format!("{keyword} 中文 café\nSecond line.");
     let saved = manager.remember(generation, &submitted).await.unwrap();
     assert_eq!(saved.record.status, WriteStatus::Succeeded);
+    assert_eq!(
+        saved.record.context.server_id.as_deref(),
+        Some(server_id.as_str())
+    );
     let result = saved.result.unwrap();
     assert_eq!(
         saved.record.references,
