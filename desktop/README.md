@@ -6,7 +6,7 @@ See [中文说明](README.zh.md), [security boundary](SECURITY.md), and [validat
 
 ## Observation
 
-The sidebar provides Overview, Connections, Memories, and Observation, with Settings & diagnostics at the bottom. Overview is the initial page. Observation contains Runtime state, Current-Scope inventory & usage, and This session tabs. Their data views are explicitly unavailable until integrated; opening the page or switching tabs does not run connection checks or local diagnostics. English/Chinese and existing theme settings apply to Observation.
+The sidebar provides Overview, Connections, Memories, and Observation, with Settings & diagnostics at the bottom. Overview is the initial page. Observation contains Runtime state, Current-Scope inventory & usage, and This session tabs. Inventory & usage hosts the qualified Statistics view; Runtime state and This session remain unavailable until integrated; opening the page or switching tabs does not run connection checks or local diagnostics. English/Chinese and existing theme settings apply to Observation.
 
 The native host collects a bounded, in-memory window of HTTP requests and Memory/Scope user operations independently of page navigation. Trusted typed IPC provides an allowlisted summary, reset and safe JSON preview. The window retains at most 512 terminal records; it preserves cancellation and unknown-write outcomes and contains no content or target identities. See the [session observation contract](../docs/en/development/desktop-session-observations.md) for measurement units, coverage, reset and failure isolation. The This session page and clipboard flow require separate UI integration.
 
@@ -106,6 +106,20 @@ Search uses FTS in the selected Scope and returns at most 10 matches. This is no
 
 A successful save that returns no memory record is reported as an operation success without inventing a reference. A timeout or interrupted dispatched write is **unknown**, not a safe invitation to retry: inspect the original Server/Scope before deciding whether to submit again. Identical text alone cannot identify that operation. Desktop does not automatically replay writes or keep an offline queue. Switching context hides old results while retaining minimal original-operation metadata for this session. See [validation guide](VALIDATION.md) for tested behavior and qualification gaps.
 
+## Current-Scope inventory and usage
+
+In **Observation → Current-Scope inventory & usage**, explicitly activate a qualified connection, select an exact Scope,
+choose **Today**, **Last 7 days** or **Last 30 days**, then press **Load statistics**.
+The view displays the Server timestamp, Scope coverage, inventory snapshot,
+recorded UTC model usage and recall token estimates. Missing token counts remain
+**Unknown**; estimates are not billing savings or quality scores. Every chart has
+an equivalent table and keyboard-scrollable region. A statistics error does not
+disable independent Memory actions. See the [developer contract](../docs/en/development/desktop-statistics.md)
+and [qualification evidence](VALIDATION.md#current-scope-statistics-qualification).
+
+Statistics require the explicit `sqlite-stats-5032075a-v1` profile; the separately
+qualified `sqlite-atomic-dd62723d-v1` profile covers Memory operations only.
+
 ## Native discovery results
 
 Connection checks call the public `get_server_info` operation through the existing native transport. `CheckReport.discovery` reports `supported`, `missing`, `denied`, `unavailable`, `invalid`, or `incompatible`, the observed Server metadata, safe errors, and per-operation `qualified`/`unsupported`/`unverified` results with reasons. Compatible discovery minor versions accept additional optional fields in the response and its nested version/feature objects.
@@ -172,7 +186,7 @@ Installed boundary checks exercise an 8192-byte Unicode note, reject over-budget
 
 After upgrading from an earlier preview, open Connections and select your saved connection. Profiles matching the bundled API contract appear under “Available for this Desktop build”; compare their tested Server builds with your deployment before selecting one, saving, checking and explicitly using the connection again. New connections start with no compatibility selection.
 
-Historical profiles appear as disabled records. A saved incompatible or unavailable selection remains visible with an explanation until explicitly replaced; it is never silently upgraded. For the qualified current Server sources, explicitly choose `sqlite-atomic-68491568-v1` and check the connection before selecting a Scope; that record's contract digest matches this build's bundled contract, while `sqlite-atomic-dd62723d-v1`, `sqlite-atomic-98275dbb-v1`, `sqlite-atomic-1da99747-v1`, `sqlite-atomic-8f10c560-v1`, `sqlite-atomic-d9a78567-v1`, `sqlite-atomic-caf2a35a-v1`, `sqlite-atomic-683e2db0-v1` and `sqlite-atomic-cab054db-v1` qualify their corresponding Server source deployments and do not match it. The recorded Server source and wheel identities must match the deployment you intend to use. The independently qualified `ci-fixtures` build is for disposable acceptance tests. Historical qualification evidence and remaining requirements are documented in the [validation guide](VALIDATION.md).
+Historical records whose digest differs from this build remain disabled. A saved incompatible or unavailable selection stays visible until explicitly replaced; it is never silently upgraded. For statistics, explicitly select `sqlite-stats-5032075a-v1`, whose recorded Server source and wheel must match the intended deployment, then check and activate the connection and select an exact Scope. This record matches the bundled contract and qualifies all twelve Desktop operations, including `get_stats`. Other records retain their original source, digest, wheel and operation sets; selecting them does not add statistics qualification. The `ci-fixtures` build is only for disposable acceptance. Source identities and remaining platform requirements are in the [validation guide](VALIDATION.md#server-5032075a-statistics-product-qualification).
 
 ## Build on macOS
 
