@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import io
 import re
-from collections.abc import Sequence
+import weakref
 from typing import Any
 from urllib.parse import quote
 
@@ -170,7 +170,9 @@ def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
         try:
             text = reader.pages[index].extract_text() or ""
         except Exception as error:  # noqa: BLE001 - do not return a partial document
-            raise ValueError(f"pdf page {index + 1} could not be parsed: {error}") from error
+            text = _retry_page_text(content, index)
+            if text is None:
+                raise ValueError(f"pdf page {index + 1} could not be parsed: {error}") from error
         pages.append(
             PDFPageInput(
                 document_id=value.document_id,
@@ -180,6 +182,15 @@ def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
             )
         )
     return tuple(pages)
+
+
+def _retry_page_text(content: bytes, index: int) -> str | None:
+    """Read one page again from a fresh reader before treating the file as unreadable."""
+
+    try:
+        return _open_reader(content).pages[index].extract_text() or ""
+    except Exception:  # noqa: BLE001 - a second failure means the document is not readable
+        return None
 
 
 class PDFPageAdapter:
@@ -247,13 +258,14 @@ async def search_pdf_pages(
 ) -> tuple[Any, ...]:
     """Return exact page citations for one natural-language question.
 
-    Retrieval always issues the documented Memory search first, then ranks the
-    physical pages the Memory holds against the question: the page body, the
-    span of the page that carries the evidence, and the structure of the report
-    (its financial statements and its numbered items).  When the scoped Memory
-    does not expose its page listing, the candidate pages are gathered through
-    the same search surface instead, so the ranking never depends on one
-    optional call.  Only citations the Memory already holds are returned.
+    The candidate pages are gathered from both documented surfaces of the
+    scoped Memory - the entry listing and the search itself - because either one
+    alone can be incomplete: a listing may expose only part of a large scope,
+    and a search admits only a few keyword formulations.  The merged pages are
+    then scored against the question, against the span of the page that carries
+    the evidence, and against the structure of the report (its financial
+    statements and its numbered items).  Only citations the Memory already holds
+    are returned, one per physical page.
     """
 
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
@@ -261,20 +273,42 @@ async def search_pdf_pages(
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")  # noqa: TRY003
 
-    seeds = await _searched_citations(memory, question, limit)
-    pages = await _stored_pages(memory)
+    seeds = await _guarded(_searched_citations(memory, question, limit, full=False), {})
+    listed = await _guarded(_listed_pages(memory), ())
+    known = {page.entry_id for page in listed if page.entry_id}
+    # A search reaches every stored page while a listing may expose only part of
+    # a large scope, so hits that the listing does not know about are the signal
+    # that the candidate set has to be completed through search.
+    pending = sum(1 for entry_id in seeds if entry_id not in known)
+    pages = listed
+    if not listed or pending * 10 >= max(1, len(seeds)):
+        seeds = await _guarded(_searched_citations(memory, question, limit, full=True), seeds)
+        extra = await _guarded(_searched_pages(memory, question, seeds, known), ())
+        pages = _merge_pages(listed, extra)
     if pages:
         ranked = _ranked_pages(question, pages, limit)
         if ranked:
             return tuple(page.citation for page in ranked)
-
-    harvested = await _harvested_pages(memory, question, seeds)
-    if harvested:
-        ranked = _ranked_pages(question, harvested, limit)
-        if ranked:
-            return tuple(page.citation for page in ranked)
-
     return tuple(list(seeds.values())[:limit])
+
+
+async def _guarded(awaitable: Any, default: Any) -> Any:
+    """Await one optional step without letting its failure fail retrieval."""
+
+    try:
+        return await awaitable
+    except Exception:  # noqa: BLE001 - retrieval degrades instead of failing
+        return default
+
+
+def _merge_pages(listed: tuple[Any, ...], extra: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Join both candidate sets, keeping one page per document and page number."""
+
+    merged: dict[tuple[str, int], Any] = {}
+    for page in list(listed) + list(extra):
+        merged.setdefault((page.document_id, page.page_number), page)
+    pages = sorted(merged.values(), key=lambda page: (page.document_id, page.page_number))
+    return tuple(pages)
 
 
 def _ranked_pages(question: str, pages: tuple[Any, ...], limit: int) -> list[Any]:
@@ -284,42 +318,46 @@ def _ranked_pages(question: str, pages: tuple[Any, ...], limit: int) -> list[Any
         return []
 
 
-async def _searched_citations(memory: Any, question: str, limit: int) -> dict[str, Any]:
+async def _searched_citations(memory: Any, question: str, limit: int, *, full: bool = True) -> dict[str, Any]:
     """Issue the documented search over a few formulations, keyed by entry id."""
 
     from powercontext.builtin.runtime.models import SearchMemoryRequest
 
     per_query = min(100, max(limit * 4, 40))
     citations: dict[str, Any] = {}
-    for variant in _query_variants(question):
+    variants = _query_variants(question)
+    for variant in variants if full else variants[:1]:
         page = await memory.search(SearchMemoryRequest(query=variant, mode="fts", limit=per_query))
         for hit in page.hits:
             citations.setdefault(hit.entry_id, _citation(hit))
     return citations
 
 
-async def _harvested_pages(
+async def _searched_pages(
     memory: Any,
     question: str,
     seeds: dict[str, Any],
+    known: set[str],
 ) -> tuple[Any, ...]:
     """Collect candidate pages through search alone, one probe per content word."""
 
     from powercontext.builtin.runtime.models import GetMemoryEntryRequest, SearchMemoryRequest
     from powercontext.sources.pdf_retrieval import Page, search_queries
 
-    citations = dict(seeds)
+    candidates = {entry_id: citation for entry_id, citation in seeds.items() if entry_id not in known}
     for query in search_queries(question):
-        if len(citations) >= _HARVEST_LIMIT:
+        if len(candidates) >= _HARVEST_LIMIT:
             break
         page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=_HARVEST_PER_QUERY))
         for hit in page.hits:
-            citations.setdefault(hit.entry_id, _citation(hit))
+            if hit.entry_id in known or hit.entry_id in candidates:
+                continue
+            candidates[hit.entry_id] = _citation(hit)
 
     seen: set[tuple[str, int]] = set()
     ordinal: dict[str, int] = {}
     pages: list[Any] = []
-    for citation in list(citations.values())[:_HARVEST_LIMIT]:
+    for entry_id, citation in list(candidates.items())[:_HARVEST_LIMIT]:
         try:
             record = await memory.get(GetMemoryEntryRequest(citation=citation))
         except Exception:  # noqa: BLE001 - a stale hit simply drops out
@@ -333,46 +371,39 @@ async def _harvested_pages(
         if key in seen:
             continue
         seen.add(key)
-        pages.append(Page(document_id=document_id, page_number=page_number, citation=citation, text=text))
-    pages.sort(key=lambda page: (page.document_id, page.page_number))
+        pages.append(
+            Page(
+                document_id=document_id,
+                page_number=page_number,
+                citation=citation,
+                text=text,
+                entry_id=entry_id,
+            )
+        )
     return tuple(pages)
 
 
-async def _search_variants(memory: Any, question: str, limit: int) -> tuple[Any, ...]:
-    """Fuse the rankings of several keyword formulations into one citation list."""
-
-    from powercontext.builtin.runtime.models import SearchMemoryRequest
-
-    fused: dict[str, float] = {}
-    citations: dict[str, Any] = {}
-    per_query = min(100, max(limit * 4, 40))
-    for variant in _query_variants(question):
-        page = await memory.search(SearchMemoryRequest(query=variant, mode="fts", limit=per_query))
-        for rank, hit in enumerate(page.hits, start=1):
-            key = hit.entry_id
-            fused[key] = fused.get(key, 0.0) + 1.0 / (60 + rank)
-            citations.setdefault(key, _citation(hit))
-
-    ordered = sorted(fused, key=lambda key: (-fused[key], key))
-    return tuple(citations[key] for key in ordered[:limit])
-
-
-async def _stored_pages(memory: Any) -> tuple[Any, ...]:
-    """Read every page the scoped Memory holds, one record per physical page."""
-
-    from powercontext.sources.pdf_retrieval import Page
+async def _listed_pages(memory: Any) -> tuple[Any, ...]:
+    """Read every page the scoped Memory lists, one record per physical page."""
 
     lister = getattr(memory, "list", None)
     if lister is None:
         return ()
-    try:
-        page = await lister()
-    except Exception:  # noqa: BLE001 - an older surface simply falls back to search
-        return ()
+    cached = _cached_listing(memory)
+    if cached is not None:
+        return cached
+    page = await lister()
+    pages = _pages_from_records(getattr(page, "entries", ()))
+    _remember_listing(memory, pages)
+    return pages
 
-    records = list(getattr(page, "entries", ()))
-    paged = [record for record in records if _is_page_entry(record)]
-    selected = paged if paged else records
+
+def _pages_from_records(records: Any) -> tuple[Any, ...]:
+    from powercontext.sources.pdf_retrieval import Page
+
+    items = list(records)
+    paged = [record for record in items if _is_page_entry(record)]
+    selected = paged if paged else items
     seen: set[tuple[str, int]] = set()
     ordinal: dict[str, int] = {}
     pages: list[Any] = []
@@ -386,9 +417,51 @@ async def _stored_pages(memory: Any) -> tuple[Any, ...]:
         if key in seen:
             continue
         seen.add(key)
-        pages.append(Page(document_id=document_id, page_number=page_number, citation=record.citation, text=text))
+        pages.append(
+            Page(
+                document_id=document_id,
+                page_number=page_number,
+                citation=record.citation,
+                text=text,
+                entry_id=_entry_id(record),
+            )
+        )
     pages.sort(key=lambda page: (page.document_id, page.page_number))
     return tuple(pages)
+
+
+def _entry_id(record: Any) -> str:
+    citation = getattr(record, "citation", None)
+    for candidate in (getattr(citation, "entry_id", ""), getattr(getattr(record, "entry", None), "entry_id", "")):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return ""
+
+
+# The listing of one scope does not change while questions are being asked, so
+# it is reused across questions instead of re-reading every entry each time.
+_LISTINGS: dict[int, tuple[Any, tuple[Any, ...]]] = {}
+_LISTINGS_LIMIT = 2
+
+
+def _cached_listing(memory: Any) -> tuple[Any, ...] | None:
+    entry = _LISTINGS.get(id(memory))
+    if entry is None:
+        return None
+    holder, pages = entry
+    if holder is not None and holder() is not memory:
+        return None
+    return pages
+
+
+def _remember_listing(memory: Any, pages: tuple[Any, ...]) -> None:
+    try:
+        holder: Any = weakref.ref(memory)
+    except TypeError:
+        holder = None
+    _LISTINGS[id(memory)] = (holder, pages)
+    while len(_LISTINGS) > _LISTINGS_LIMIT:
+        _LISTINGS.pop(next(iter(_LISTINGS)))
 
 
 def _is_page_entry(record: Any) -> bool:
@@ -485,10 +558,6 @@ def _open_reader(content: bytes) -> Any:
         if not unlocked:
             raise ValueError("pdf document requires a non-empty password")  # noqa: TRY003
     return reader
-
-
-def _pages(pages: Sequence[Any]) -> Sequence[Any]:
-    return pages
 
 
 __all__ = [

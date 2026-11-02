@@ -231,6 +231,7 @@ class Page:
     page_number: int
     citation: object
     text: str
+    entry_id: str = ""
 
 
 class Corpus:
@@ -319,11 +320,7 @@ class Corpus:
         return self.keys[index][0]
 
     def documents(self) -> list[str]:
-        seen: list[str] = []
-        for document_id, _ in self.keys:
-            if document_id not in seen:
-                seen.append(document_id)
-        return seen
+        return list(dict.fromkeys(document_id for document_id, _ in self.keys))
 
     def text(self, index: int) -> str:
         return self.pages[index].text
