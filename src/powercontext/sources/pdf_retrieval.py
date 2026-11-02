@@ -58,6 +58,47 @@ _EXPANSIONS: dict[str, tuple[str, ...]] = {
     "cyclical": ("season", "cycl", "econom"),
 }
 
+# Raw word forms used only when a question has to be turned into lexical
+# probes: the index analyzes whole words, so probing has to as well.
+_SEARCH_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "geograph": ("regions", "countries", "territories", "worldwide", "global"),
+    "legal": ("litigation", "lawsuit", "proceedings", "claims", "regulatory", "court", "settlement"),
+    "custom": ("customers", "clients", "consumers", "retailers", "distributors"),
+    "employ": ("employees", "headcount", "workforce"),
+    "product": ("products", "brands", "portfolio", "services"),
+    "competit": ("competitors", "competition", "rivals"),
+    "cyclical": ("seasonal", "cyclical", "economy"),
+}
+
+
+def search_queries(question: str, limit: int = 14) -> list[str]:
+    """Word forms worth probing a lexical index with, in decreasing importance."""
+
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def add(word: str) -> None:
+        if word in seen:
+            return
+        seen.add(word)
+        queries.append(word)
+
+    words = WORD.findall(question.lower())
+    for word in words:
+        if word in _STOPWORDS or (len(word) == 1 and not word.isdigit()):
+            continue
+        add(word)
+    for word in words:
+        if word in _STOPWORDS:
+            continue
+        key = _key(word)
+        for prefix, related in _SEARCH_EXPANSIONS.items():
+            if key.startswith(prefix) or prefix.startswith(key[:6]):
+                for related_word in related:
+                    add(related_word)
+    return queries[:limit]
+
+
 # Statement headings, in the wording different filers use.
 _STATEMENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("income", re.compile(r"statements? of (income|operations|earnings)")),
@@ -525,4 +566,4 @@ def rank(question: str, corpus: Corpus, limit: int) -> list[Page]:
     return [corpus.pages[index] for index in ordered[:limit]]
 
 
-__all__ = ["Corpus", "Page", "content_terms", "rank", "stem", "resolve_document"]
+__all__ = ["Corpus", "Page", "content_terms", "rank", "resolve_document", "search_queries", "stem"]

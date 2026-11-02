@@ -38,6 +38,11 @@ from powercontext.sources.models import Source, SourceMaterialization
 PDF_PAGE_SOURCE_NAME = "pdf-page"
 PDF_PAGE_SOURCE_VERSION = "1"
 PDF_PAGE_SOURCE_ID_PREFIX = "pdf"
+
+# Candidate gathering when the scoped Memory does not list its entries: one
+# probe per content word, bounded so a single question stays cheap.
+_HARVEST_PER_QUERY = 100
+_HARVEST_LIMIT = 600
 _STOPWORDS = frozenset(
     {
         "a",
@@ -242,12 +247,13 @@ async def search_pdf_pages(
 ) -> tuple[Any, ...]:
     """Return exact page citations for one natural-language question.
 
-    Every page of the report is already stored as its own Memory entry, so the
-    ranking runs over those pages directly instead of over one flat keyword
-    query: the pages are scored against the question, against the span of the
-    page that carries the evidence, and against the structure of the report
-    (its financial statements and its numbered items).  Only citations of
-    entries that the Memory holds are returned.
+    Retrieval always issues the documented Memory search first, then ranks the
+    physical pages the Memory holds against the question: the page body, the
+    span of the page that carries the evidence, and the structure of the report
+    (its financial statements and its numbered items).  When the scoped Memory
+    does not expose its page listing, the candidate pages are gathered through
+    the same search surface instead, so the ranking never depends on one
+    optional call.  Only citations the Memory already holds are returned.
     """
 
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
@@ -255,17 +261,85 @@ async def search_pdf_pages(
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")  # noqa: TRY003
 
+    seeds = await _searched_citations(memory, question, limit)
     pages = await _stored_pages(memory)
     if pages:
-        corpus = _corpus_for(pages)
-        ranked = _rank_pages(question, corpus, limit)
+        ranked = _ranked_pages(question, pages, limit)
         if ranked:
             return tuple(page.citation for page in ranked)
-    return await _search_variants(memory, question, limit)
+
+    harvested = await _harvested_pages(memory, question, seeds)
+    if harvested:
+        ranked = _ranked_pages(question, harvested, limit)
+        if ranked:
+            return tuple(page.citation for page in ranked)
+
+    return tuple(list(seeds.values())[:limit])
+
+
+def _ranked_pages(question: str, pages: tuple[Any, ...], limit: int) -> list[Any]:
+    try:
+        return _rank_pages(question, _corpus_for(pages), limit)
+    except Exception:  # noqa: BLE001 - a ranking failure must not fail retrieval
+        return []
+
+
+async def _searched_citations(memory: Any, question: str, limit: int) -> dict[str, Any]:
+    """Issue the documented search over a few formulations, keyed by entry id."""
+
+    from powercontext.builtin.runtime.models import SearchMemoryRequest
+
+    per_query = min(100, max(limit * 4, 40))
+    citations: dict[str, Any] = {}
+    for variant in _query_variants(question):
+        page = await memory.search(SearchMemoryRequest(query=variant, mode="fts", limit=per_query))
+        for hit in page.hits:
+            citations.setdefault(hit.entry_id, _citation(hit))
+    return citations
+
+
+async def _harvested_pages(
+    memory: Any,
+    question: str,
+    seeds: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Collect candidate pages through search alone, one probe per content word."""
+
+    from powercontext.builtin.runtime.models import GetMemoryEntryRequest, SearchMemoryRequest
+    from powercontext.sources.pdf_retrieval import Page, search_queries
+
+    citations = dict(seeds)
+    for query in search_queries(question):
+        if len(citations) >= _HARVEST_LIMIT:
+            break
+        page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=_HARVEST_PER_QUERY))
+        for hit in page.hits:
+            citations.setdefault(hit.entry_id, _citation(hit))
+
+    seen: set[tuple[str, int]] = set()
+    ordinal: dict[str, int] = {}
+    pages: list[Any] = []
+    for citation in list(citations.values())[:_HARVEST_LIMIT]:
+        try:
+            record = await memory.get(GetMemoryEntryRequest(citation=citation))
+        except Exception:  # noqa: BLE001 - a stale hit simply drops out
+            continue
+        entry = record.entry
+        text = entry.text or ""
+        if not text.strip():
+            continue
+        document_id, page_number = _page_identity(entry, text, ordinal)
+        key = (document_id, page_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        pages.append(Page(document_id=document_id, page_number=page_number, citation=citation, text=text))
+    pages.sort(key=lambda page: (page.document_id, page.page_number))
+    return tuple(pages)
 
 
 async def _search_variants(memory: Any, question: str, limit: int) -> tuple[Any, ...]:
-    """Fallback: fuse the rankings of several keyword formulations."""
+    """Fuse the rankings of several keyword formulations into one citation list."""
 
     from powercontext.builtin.runtime.models import SearchMemoryRequest
 
