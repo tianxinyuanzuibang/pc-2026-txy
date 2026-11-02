@@ -242,17 +242,32 @@ async def search_pdf_pages(
 ) -> tuple[Any, ...]:
     """Return exact page citations for one natural-language question.
 
-    Several offline query formulations are issued against the same scoped
-    Memory and their rankings are fused, so a question phrased with filler words
-    still reaches pages that only share its rare terms or figures.
+    Every page of the report is already stored as its own Memory entry, so the
+    ranking runs over those pages directly instead of over one flat keyword
+    query: the pages are scored against the question, against the span of the
+    page that carries the evidence, and against the structure of the report
+    (its financial statements and its numbered items).  Only citations of
+    entries that the Memory holds are returned.
     """
-
-    from powercontext.builtin.runtime.models import SearchMemoryRequest
 
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("limit must be a positive integer")  # noqa: TRY003
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")  # noqa: TRY003
+
+    pages = await _stored_pages(memory)
+    if pages:
+        corpus = _corpus_for(pages)
+        ranked = _rank_pages(question, corpus, limit)
+        if ranked:
+            return tuple(page.citation for page in ranked)
+    return await _search_variants(memory, question, limit)
+
+
+async def _search_variants(memory: Any, question: str, limit: int) -> tuple[Any, ...]:
+    """Fallback: fuse the rankings of several keyword formulations."""
+
+    from powercontext.builtin.runtime.models import SearchMemoryRequest
 
     fused: dict[str, float] = {}
     citations: dict[str, Any] = {}
@@ -268,6 +283,60 @@ async def search_pdf_pages(
     return tuple(citations[key] for key in ordered[:limit])
 
 
+async def _stored_pages(memory: Any) -> tuple[Any, ...]:
+    """Read every page the scoped Memory holds, one record per physical page."""
+
+    from powercontext.sources.pdf_retrieval import Page
+
+    lister = getattr(memory, "list", None)
+    if lister is None:
+        return ()
+    try:
+        page = await lister()
+    except Exception:  # noqa: BLE001 - an older surface simply falls back to search
+        return ()
+
+    records = list(getattr(page, "entries", ()))
+    paged = [record for record in records if _is_page_entry(record)]
+    selected = paged if paged else records
+    seen: set[tuple[str, int]] = set()
+    ordinal: dict[str, int] = {}
+    pages: list[Any] = []
+    for record in selected:
+        entry = record.entry
+        text = entry.text or ""
+        if not text.strip():
+            continue
+        document_id, page_number = _page_identity(entry, text, ordinal)
+        key = (document_id, page_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        pages.append(Page(document_id=document_id, page_number=page_number, citation=record.citation, text=text))
+    pages.sort(key=lambda page: (page.document_id, page.page_number))
+    return tuple(pages)
+
+
+def _is_page_entry(record: Any) -> bool:
+    for reference in getattr(getattr(record, "entry", None), "sources", ()):
+        if getattr(reference, "source_type", "") == PDF_PAGE_SOURCE_NAME:
+            return True
+    return False
+
+
+def _page_identity(entry: Any, text: str, ordinal: dict[str, int]) -> tuple[str, int]:
+    document_id = text.split("\n", 1)[0].strip()
+    for reference in getattr(entry, "sources", ()):
+        source_id = getattr(reference, "source_id", "")
+        if not isinstance(source_id, str) or not source_id.startswith(f"{PDF_PAGE_SOURCE_ID_PREFIX}:"):
+            continue
+        parts = source_id.rsplit(":", 2)
+        if len(parts) == 3 and parts[2].isdigit():
+            return document_id, int(parts[2])
+    ordinal[document_id] = ordinal.get(document_id, 0) + 1
+    return document_id, ordinal[document_id]
+
+
 def _citation(hit: Any) -> Any:
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
 
@@ -276,6 +345,40 @@ def _citation(hit: Any) -> Any:
         entry_id=hit.entry_id,
         entry_version_id=hit.entry_version_id,
     )
+
+
+_CORPUS_CACHE: dict[str, Any] = {}
+_CORPUS_CACHE_LIMIT = 4
+
+
+def _corpus_key(pages: tuple[Any, ...]) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(len(pages)).encode("utf-8"))
+    for page in (pages[0], pages[-1]):
+        digest.update(f"{page.document_id}|{page.page_number}|{page.citation!r}".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _corpus_for(pages: tuple[Any, ...]) -> Any:
+    """Reuse the page statistics while the same report set stays in memory."""
+
+    from powercontext.sources.pdf_retrieval import Corpus
+
+    key = _corpus_key(pages)
+    cached = _CORPUS_CACHE.get(key)
+    if cached is not None and len(cached.pages) == len(pages):
+        return cached
+    corpus = Corpus(list(pages))
+    _CORPUS_CACHE[key] = corpus
+    while len(_CORPUS_CACHE) > _CORPUS_CACHE_LIMIT:
+        _CORPUS_CACHE.pop(next(iter(_CORPUS_CACHE)))
+    return corpus
+
+
+def _rank_pages(question: str, corpus: Any, limit: int) -> list[Any]:
+    from powercontext.sources.pdf_retrieval import rank
+
+    return rank(question, corpus, limit)
 
 
 def _query_variants(question: str) -> tuple[str, ...]:
