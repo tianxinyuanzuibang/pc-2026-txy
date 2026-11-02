@@ -218,9 +218,6 @@ class Corpus:
         frequency = self.document_frequency(term)
         return math.log(1.0 + (total - frequency + 0.5) / (frequency + 0.5))
 
-    def terms_in(self, index: int, terms: set[str]) -> set[str]:
-        return terms.intersection(self._counts[index])
-
     # -- scoring --------------------------------------------------------
     def bm25(self, weights: dict[str, float], allowed: list[int]) -> list[float]:
         scores = [0.0] * len(self.pages)
