@@ -149,6 +149,9 @@ _STATEMENT_WEIGHT = 1.8
 _ITEM_WEIGHT = 1.4
 _HEADING_WEIGHT = 0.6
 _ITEM_SPAN = 3
+# How far the opening of a section keeps its advantage, and how strong it is.
+_ITEM_SECTION_SPAN = 26
+_SECTION_WEIGHT = 0.6
 
 def stem(word: str) -> str:
     """Reduce one lower-case English word to a comparison key."""
@@ -648,6 +651,17 @@ def rank(question: str, corpus: Corpus, limit: int) -> list[Page]:
                 break
             boost(start + offset, _ITEM_WEIGHT - 0.1 * added)
             added += 1
+
+    # A description of the business is spread over the whole of the first item,
+    # so the pages that open it are not the only ones that can answer such a
+    # question: the section is favoured with a bonus that fades with distance.
+    if not _is_metric_question(term_set):
+        opening = items.get("1")
+        closing = items.get("1a") or items.get("2")
+        if opening and closing and closing > opening:
+            span = min(closing - opening, _ITEM_SECTION_SPAN)
+            for offset in range(span):
+                boost(opening + offset, _SECTION_WEIGHT * (1.0 - offset / span))
 
     ordered = sorted(signals.scores, key=lambda index: (-signals.scores[index], corpus.keys[index]))
     return [corpus.pages[index] for index in ordered[:limit]]
