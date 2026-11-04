@@ -32,6 +32,9 @@ from dataclasses import dataclass, field
 
 WORD = re.compile(r"[a-z]+|\d+")
 _ALNUM = re.compile(r"[^a-z0-9]+")
+# Words as they are written in a question, so that a short form or a ticker
+# can be recognised by the way it is capitalised.
+_WORD = re.compile(r"[A-Za-z0-9]+")
 
 # Function words that carry no retrieval signal in a natural-language question.
 _STOPWORDS = frozenset(
@@ -110,6 +113,10 @@ _STATEMENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 _STATEMENT_HEADINGS = {name: pattern for name, pattern in _STATEMENT_PATTERNS}
 
+# How many figures a page has to carry before it reads as a statement table
+# rather than as a note or an index that names the same statement.
+_STATEMENT_FIGURES = 90
+
 # Form 10-K items and the words that introduce them.
 _ITEMS: dict[str, str] = {
     "1": "business",
@@ -125,14 +132,13 @@ _ITEMS: dict[str, str] = {
 _ITEM_HEADING = re.compile(r"(?i)\bitem\s+(\d{1,2})([ab])?\s*[\.\:]\s*([a-z][a-z ,'&\-]{2,60})")
 _ITEM_REFERENCE = re.compile(r"(?i)(see\s+(also\s+)?|refer\s+to\s+|in\s+|under\s+|per\s+)$")
 
-# Words that mark a question as being about a reported figure.
-_METRIC_TERMS = frozenset(
-    """
+# Words that mark a question as being about a reported figure.  They are
+# compared as stems, because that is how a question is indexed as well.
+_METRIC_WORDS = """
     margin ebitda capex revenue income profit profitability cost expense liability asset
     liquidity ratio rate tax cash debt capital growth percentage amount balance sheet
     flow operation investing financing dividend earning
-    """.split()
-)
+    """
 
 # Ranking knobs.  They are constants rather than configuration because the
 # acceptance run fixes the resource profile of the product.
@@ -196,6 +202,14 @@ def _key(word: str) -> str:
     return reduced[:6] if len(reduced) > 6 else reduced
 
 
+# The vocabulary a question is looked up with, so every list of words that is
+# matched against a question has to be written in the same shape.
+_METRIC_TERMS = frozenset(_key(word) for word in _METRIC_WORDS.split())
+_BALANCE_TERMS = frozenset(_key(word) for word in "liability asset liquidity ratio balance receivable inventory".split())
+_CASH_TERMS = frozenset(_key(word) for word in "cash capex flow investing financing dividend depreciation operating".split())
+_LEGAL_TERMS = frozenset(_key(word) for word in "legal litigation battle claim proceeding lawsuit".split())
+
+
 def content_terms(question: str) -> list[str]:
     """Comparison keys of the question, in order, without function words."""
 
@@ -246,6 +260,8 @@ class Corpus:
         self._average = (sum(self._lengths) / len(pages)) if pages else 1.0
         self._document_frequency: dict[str, int] = {}
         self._pair_sets = [set(zip(tokens, tokens[1:])) for tokens in self._tokens]
+        self._mentions: dict[tuple[str, str], bool] = {}
+        self._by_document: dict[str, list[int]] = {}
 
     # -- statistics -----------------------------------------------------
     def document_frequency(self, term: str) -> int:
@@ -325,6 +341,24 @@ class Corpus:
     def text(self, index: int) -> str:
         return self.pages[index].text
 
+    def mentions(self, document_id: str, token: str) -> bool:
+        """Whether one report writes a word the way the question wrote it."""
+
+        if not token:
+            return False
+        cached = self._mentions.get((document_id, token))
+        if cached is None:
+            cached = any(token in self.text(index) for index in self._indexes_of(document_id))
+            self._mentions[(document_id, token)] = cached
+        return cached
+
+    def _indexes_of(self, document_id: str) -> list[int]:
+        cached = self._by_document.get(document_id)
+        if cached is None:
+            cached = [index for index in range(len(self.pages)) if self.document_of(index) == document_id]
+            self._by_document[document_id] = cached
+        return cached
+
 
 def _page_tokens(text: str) -> list[str]:
     tokens: list[str] = []
@@ -352,17 +386,61 @@ def _company_key(document_id: str) -> str:
 def resolve_document(corpus: Corpus, question: str, lexical: list[float]) -> str | None:
     """Pick the report a question is about, by name first and by period second."""
 
-    flat = _ALNUM.sub("", question.lower())
     documents = corpus.documents()
     if not documents:
         return None
-    named = [document_id for document_id in documents if _names(flat, document_id)]
-    return _best_period(named or documents, question, lexical, corpus)
+    scored = [(_name_affinity(question, document_id, corpus), document_id) for document_id in documents]
+    strength = max(score[0] for score, _ in scored)
+    if strength == 0:
+        candidates = documents
+    else:
+        overlap = max(score[1] for score, _ in scored if score[0] == strength)
+        candidates = [document_id for score, document_id in scored if score[0] == strength and score[1] >= overlap]
+    return _best_period(candidates, question, lexical, corpus)
 
 
-def _names(flat_question: str, document_id: str) -> bool:
+def _name_affinity(question: str, document_id: str, corpus: Corpus) -> tuple[int, int]:
+    """How strongly a question names one report: 2 strong, 1 weak, 0 none.
+
+    A question may spell the company out, use its short form ("Amex") or only
+    its ticker ("3M").  A short form only counts when the report itself writes
+    that word the same way, which keeps "AMEX" from matching an unrelated
+    report whose name merely starts with the same letters.
+    """
+
     key = _company_key(document_id)
-    return len(key) >= 3 and key in flat_question
+    if not key:
+        return (0, 0)
+    flat = _ALNUM.sub("", question.lower())
+    if len(key) >= 3 and key in flat:
+        return (2, len(key))
+    strength = 0
+    overlap_best = 0
+    for word in _WORD.findall(question):
+        if word == word.lower():
+            continue  # a plain lower-case word only counts through the whole name
+        lowered = word.lower()
+        if lowered == key:
+            return (2, len(key))
+        overlap = _common_prefix(lowered, key)
+        if word.isupper() and len(word) >= 3 and overlap >= 3 and overlap >= len(word) - 1:
+            if not corpus.mentions(document_id, word):
+                continue
+            if overlap > overlap_best:
+                strength, overlap_best = 2, overlap
+        elif overlap >= 3 and len(lowered) >= 3 and key.startswith(lowered):
+            if corpus.mentions(document_id, word) and overlap > overlap_best:
+                strength, overlap_best = max(strength, 1), overlap
+    return (strength, overlap_best)
+
+
+def _common_prefix(first: str, second: str) -> int:
+    length = 0
+    for left, right in zip(first, second):
+        if left != right:
+            break
+        length += 1
+    return length
 
 
 _YEAR = re.compile(r"(?:19|20)\d{2}")
@@ -409,7 +487,13 @@ def _numeric_tokens(text: str) -> int:
 
 
 def statement_pages(corpus: Corpus, document_id: str) -> dict[str, int]:
-    """First page of each primary financial statement of one report."""
+    """First page of each primary financial statement of one report.
+
+    A financial statement is a table: its page carries far more figures than
+    the notes and the index that mention the same wording, so the pages that
+    count are the ones with a dense table of numbers, and among those the
+    first one wins.
+    """
 
     pages: dict[str, int] = {}
     indexes = sorted(
@@ -417,6 +501,7 @@ def statement_pages(corpus: Corpus, document_id: str) -> dict[str, int]:
         key=lambda index: corpus.keys[index][1],
     )
     last_page = int(len(indexes) * 0.7)
+    candidates: dict[str, list[tuple[int, int]]] = {}
     for index in indexes:
         if corpus.keys[index][1] > last_page:
             break
@@ -426,16 +511,21 @@ def statement_pages(corpus: Corpus, document_id: str) -> dict[str, int]:
         head = flat[:200]
         if head.startswith("index to"):
             continue
-        if _numeric_tokens(flat) < 40:
+        figures = _numeric_tokens(flat)
+        if figures < 40:
             continue
         found = [name for name, pattern in _STATEMENT_PATTERNS if pattern.search(flat)]
         if len(found) >= 2:
             continue  # a listing page rather than the statement itself
         for name in found:
-            if name in pages:
-                continue
             if _STATEMENT_HEADINGS[name].search(head):
-                pages[name] = corpus.keys[index][1]
+                candidates.setdefault(name, []).append((corpus.keys[index][1], figures))
+    for name, found in candidates.items():
+        dense = [page for page, figures in found if figures >= _STATEMENT_FIGURES]
+        if dense:
+            pages[name] = min(dense)
+        else:
+            pages[name] = max(found, key=lambda item: item[1])[0]
     return pages
 
 
@@ -471,9 +561,9 @@ def item_pages(corpus: Corpus, document_id: str) -> dict[str, int]:
 
 
 def _statement_order(terms: set[str]) -> list[str]:
-    if terms.intersection({"liability", "asset", "liquid", "ratio", "balance", "receivable", "inventori"}):
+    if terms.intersection(_BALANCE_TERMS):
         return ["balance", "income", "cash", "comprehensive", "equity"]
-    if terms.intersection({"cash", "capex", "flow", "invest", "financ", "dividend", "depreci", "operat"}):
+    if terms.intersection(_CASH_TERMS):
         return ["cash", "income", "balance", "comprehensive", "equity"]
     return ["income", "cash", "balance", "comprehensive", "equity"]
 
@@ -548,7 +638,7 @@ def rank(question: str, corpus: Corpus, limit: int) -> list[Page]:
                 break
             boost(statements.get(name), _STATEMENT_WEIGHT - 0.2 * position)
     starts: list[int] = []
-    if term_set.intersection({"legal", "litig", "battl", "claim"}):
+    if term_set.intersection(_LEGAL_TERMS):
         starts.append(items.get("3"))
     starts.extend([items.get("1"), items.get("7")])
     added = 0
